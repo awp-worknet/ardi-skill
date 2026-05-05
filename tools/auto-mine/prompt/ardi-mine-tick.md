@@ -7,106 +7,144 @@ fire automatically in 60-180 seconds.
 
 ## What Ardi is
 
-Every 6 minutes the coordinator opens a new epoch with 15 multilingual
+Every 6 minutes the coordinator opens a new epoch with ~30 multilingual
 riddles. To win an Ardinal NFT you must:
 
-1. Read a riddle, solve it (the answer is a single word in one of
-   en/zh/ja/ko/fr/de).
-2. `commit` your answer's hash within 180s of epoch open.
-3. `reveal` the plaintext within 180s of commit close.
-4. If Chainlink VRF picks you among the correct revealers, `inscribe`
-   the NFT.
+1. Read a riddle, solve it (the answer is a single word in the riddle's
+   native language — en/zh/ja/ko/fr/de).
+2. `commit` your answer's hash within ~180s of epoch open.
+3. `reveal` the plaintext after the commit window closes + ~30s grace.
+4. If Chainlink VRF picks you among correct revealers, `inscribe` the NFT.
 
-Hard caps: max 5 commits per agent per epoch, max 3 NFT wins per agent total.
+Hard caps: **5 commits per agent per epoch**, **5 Ardinals per agent total**.
 
 ## Available tools
 
 You have shell access. The only Ardi-specific tool is the `ardi-agent`
-CLI — no other binaries needed. Useful invocations:
+CLI. Useful invocations:
 
 ```bash
-ardi-agent context        # JSON: current epoch + 15 riddles
+ardi-agent context        # JSON: current epoch + riddles
 ardi-agent commits        # JSON: local pending (committed/revealed/won/lost)
-ardi-agent stake          # check eligibility (need stake >= minStake)
-ardi-agent commit --epoch N --word-id W --answer "X"
+ardi-agent commit --word-id W --answer "X"
 ardi-agent reveal --epoch N --word-id W
 ardi-agent inscribe --epoch N --word-id W
-ardi-agent gas            # ETH balance check (commit needs ~0.0002/cycle)
+ardi-agent gas            # ETH balance check
 ```
 
-All commands print JSON to stdout. Parse with `jq`.
+All commands print JSON to stdout.
 
 ## Per-tick procedure
 
 ### Step 1 — fetch state (always)
 
 ```bash
-ardi-agent context > /tmp/ctx.json
-ardi-agent commits > /tmp/commits.json
+ardi-agent context > /tmp/ctx.json 2>&1
+ardi-agent commits > /tmp/commits.json 2>&1
 ```
 
-If `context` returns "no epoch in commit window", that means the current
-epoch's commit window has already closed. You can still do reveal/inscribe
-work for past epochs (Step 3).
+If `context` returns `NO_OPEN_EPOCH`, skip Step 2 entirely and go to Step 3
+(there may still be reveals/inscribes pending from prior epochs).
 
 ### Step 2 — commit (if commit window is open)
 
-Only if ALL of these hold:
-- A current epoch exists (parse `epoch_id` from `/tmp/ctx.json`).
-- The commit window is still open (epoch.commit_deadline > now).
-- You have NOT already committed in this epoch (check `/tmp/commits.json`
-  — count entries where `epoch_id == current` and `status` is one of
-  committed/revealed/won/inscribed; if >= MAX_PER_EPOCH, skip).
+**Commitment EV model — read this before picking answers:**
 
-Then:
-- Read up to `MAX_PER_EPOCH` riddles (env, default 3) from
-  `/tmp/ctx.json` `riddles` array.
-- Pick the ones you can solve with reasonable confidence (>= 50%).
-  **Skip the rest** — bond is small but real. Do not guess.
-- For each picked riddle, call:
-  ```bash
-  ardi-agent commit --epoch $EPOCH --word-id $WID --answer "$ANSWER"
-  ```
-- If a commit reverts with `InsufficientStake`, stop and exit — agent
-  needs to top up stake out-of-band.
+- Bond (0.00001 ETH) is refunded on reveal REGARDLESS of whether your
+  answer is correct. Wrong answer = bond back + out of VRF pool. No answer
+  = bond forfeited. Therefore: **empty commit slots have EV 0; any guess
+  with >0% chance of being right has positive EV.**
+- Fill all 5 slots. Only leave a slot empty if you genuinely cannot form
+  even a wild guess at what the word might be.
+- Rank riddles by `power` descending (legendary ~80 > rare ~50 > common ~20).
+  Spend your best reasoning on the highest-power riddles first.
+
+**How to solve riddles:**
+
+Read the full `riddle` text and `language` field. Answer in the SAME
+language as the riddle — do NOT translate into English then translate back.
+
+Approach per riddle:
+1. Identify the linguistic/cultural register: concrete noun? abstract concept?
+   proper noun? verb?
+2. The riddle describes the word — it is almost always a single common word
+   or proper noun.
+3. For each language:
+   - **en**: straightforward. Take the most literal answer first.
+   - **zh**: answer is a Chinese word/idiom. Write in simplified characters.
+   - **ja**: answer is a Japanese word. Write in hiragana, katakana, or kanji
+     as the riddle implies. E.g. if the riddle is poetic/classical use kanji.
+   - **ko**: answer is a Korean word. Write in Hangul.
+   - **fr**: answer in French. Watch for gender agreement clues in the riddle.
+   - **de**: answer in German. Watch for capitalisation (all nouns cap in DE).
+4. When multiple words feel possible, prefer the most common, concrete,
+   dictionary-entry form. Avoid synonyms, slang, or compound variations
+   unless the riddle clearly points there.
+5. For `legendary` or `rare` riddles: spend 30 extra seconds reasoning.
+   These are worth 3-4× a common riddle if you win VRF.
+
+**Committing — SERIAL, never parallel:**
+
+Each commit must complete before starting the next (nonce management).
+
+```bash
+# Check how many commits already exist for this epoch
+EPOCH=$(jq -r '.data.current.epoch_id' /tmp/ctx.json)
+ALREADY=$(jq "[.data[] | select(.epoch_id==$EPOCH)] | length" /tmp/commits.json)
+SLOTS=$((5 - ALREADY))   # how many slots remain
+
+# For each riddle you've chosen (up to $SLOTS), run serially:
+ardi-agent commit --word-id W1 --answer "answer1"
+ardi-agent commit --word-id W2 --answer "answer2"
+# ...
+```
+
+If a commit returns `ALREADY_COMMITTED` for a word-id, skip it.
+If it returns `COMMIT_WINDOW_CLOSED`, stop committing and go to Step 3.
 
 ### Step 3 — drive pending state forward
 
-For each entry in `/tmp/commits.json`:
+```bash
+cat /tmp/commits.json
+```
+
+For each entry by status:
 
 | status | action |
 |---|---|
-| `committed` | Run `ardi-agent reveal --epoch X --word-id Y`. Skill auto-checks if reveal window is open; reverts harmlessly if not. |
-| `revealed` | Run `ardi-agent inscribe --epoch X --word-id Y`. Skill checks if you won via VRF and only mints if so; otherwise marks the entry as lost. |
-| `won` | Same — `ardi-agent inscribe --epoch X --word-id Y`. |
-| `lost` / `inscribed` | Skip. |
+| `committed` | `ardi-agent reveal --epoch X --word-id Y` — if `REVEAL_TX_FAILED`, wait 30s and retry once |
+| `revealed` | `ardi-agent inscribe --epoch X --word-id Y` |
+| `won` | `ardi-agent inscribe --epoch X --word-id Y` |
+| `lost` / `inscribed` | skip |
 
-Don't retry the same commit if it reverts twice — log the reason and exit.
+Do not retry a reveal or inscribe more than once per tick if it keeps failing — log and move on.
 
 ### Step 4 — exit
 
-Print a one-line summary of what you did this tick:
-- "tick: committed N, revealed N, inscribed N, skipped N"
+Print a one-line tick summary:
+```
+tick · epoch N · committed X · revealed Y · inscribed Z · skipped W
+```
 
-Then exit cleanly. Do NOT poll or sleep — the next tick fires automatically.
+Then exit cleanly. Do NOT poll or sleep — the scheduler fires the next tick.
 
-## Hard rules (do not violate)
+## Hard rules
 
-1. **Time budget**: 4 minutes max per tick. If you're still solving at
-   the 3-minute mark, commit what you have and exit.
-2. **Confidence threshold**: 50% minimum. If a riddle is in a language
-   you can't read, skip it.
-3. **Never commit twice to the same wordId** — skill will reject it
-   anyway, don't waste gas on the failed tx.
-4. **No retries on revert** — if `commit` / `reveal` / `inscribe` reverts,
-   log the error message and move on.
-5. **Don't open new epochs** — that's the coordinator's job. Don't call
-   `cast send openEpoch`.
-6. **Stay in this skill's lane** — no fusion, repair, market, transfer
-   ops in autonomous mode (those are user-driven actions).
+1. **Time budget**: 4 minutes max per tick. Commit what you have by the
+   3-minute mark and exit — the reveal happens next tick.
+2. **Fill all 5 slots** if you have any guess at all. Bond is refunded on
+   reveal. Empty slots earn nothing.
+3. **Never commit twice to the same wordId** in the same epoch.
+4. **Serial commits only** — parallel commits collide on the same nonce and
+   all but one are dropped by the node.
+5. **Answer in the riddle's native language** — `zh`, `ja`, `ko`, `fr`, `de`
+   riddles need answers in those scripts/languages respectively.
+6. **Don't broadcast transactions yourself** — only use `ardi-agent` commands.
+7. **No transfer, repair, market, or fusion ops** in autonomous mode.
 
 ## Failure handling
 
-If you can't proceed (e.g., RPC down, awp-wallet missing), print one line
-explaining why and exit non-zero. systemd will log it and the next tick
-will retry.
+- RPC/coordinator down → print one line, exit 1. Next tick retries.
+- `INSUFFICIENT_GAS` → print balance warning, exit 1. Operator funds wallet.
+- `NOT_STAKED` → print staking warning, exit 1. Operator re-stakes.
+- Any other unrecognised error → print `error_code` + `message`, exit 1.
