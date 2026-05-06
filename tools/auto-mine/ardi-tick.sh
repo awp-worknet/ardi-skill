@@ -59,9 +59,9 @@ reason=""
 # (a) check current epoch
 if ctx="$($ARDI_AGENT "${SERVER_ARG[@]}" context 2>/dev/null)"; then
   # has epoch + commit_deadline > now
-  has_open_epoch="$(echo "$ctx" | grep -E '"commit_deadline"\s*:' | head -1 || true)"
+  has_open_epoch="$(echo "$ctx" | grep -E '"commitDeadline"\s*:' | head -1 || true)"
   if [[ -n "$has_open_epoch" ]]; then
-    deadline="$(echo "$ctx" | sed -nE 's/.*"commit_deadline"\s*:\s*([0-9]+).*/\1/p' | head -1)"
+    deadline="$(echo "$ctx" | sed -nE 's/.*"commitDeadline"\s*:\s*([0-9]+).*/\1/p' | head -1)"
     now="$(date +%s)"
     if [[ -n "$deadline" && "$deadline" -gt "$now" ]]; then
       need_to_run="yes"
